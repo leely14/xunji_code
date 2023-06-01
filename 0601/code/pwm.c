@@ -1,0 +1,259 @@
+/****************************************************/
+// MSP432P401R
+// 定时器A
+// Bilibili：m-RNA
+// E-mail:m-RNA@qq.com
+// 创建日期:2021/8/26
+/****************************************************/
+
+#include "pwm.h"
+#include "oled.h"
+#include "delay.h"
+Timer_A_PWMConfig pwmConfig10 =
+{
+        TIMER_A_CLOCKSOURCE_SMCLK,
+        TIMER_A_CLOCKSOURCE_DIVIDER_1,
+        500,    //CCR0初始周期为2ms
+        TIMER_A_CAPTURECOMPARE_REGISTER_1,
+        TIMER_A_OUTPUTMODE_RESET_SET,
+        400       //初始占空比为0
+};
+Timer_A_PWMConfig pwmConfig11 =
+{
+        TIMER_A_CLOCKSOURCE_SMCLK,
+        TIMER_A_CLOCKSOURCE_DIVIDER_1,
+        500,
+        TIMER_A_CAPTURECOMPARE_REGISTER_1,
+        TIMER_A_OUTPUTMODE_RESET_SET,
+        400
+};
+#define PID_INTEGRAL_ON    //位置式PID是否包含积分项。如果仅用PD控制，注释本行
+ 
+typedef struct PID
+{ 
+    float P;               
+    float I;
+    float D;	
+#ifdef 	PID_INTEGRAL_ON
+    float Integral;        //位置式PID积分项
+    float IntegralMax;     //位置式PID积分项最大值，用于限幅
+#endif	
+    float Last_Error;      //上一次误差	
+    float OutputMax;       //位置式PID输出最大值，用于限幅
+}PID;
+PID a={
+	.P=10,
+	.I=3,
+	.D=3,
+	.Integral=3,
+	.IntegralMax=3,
+	.Last_Error=0,
+	.OutputMax=100,
+};
+bool IsLastFlag=false;
+float PidOutLeft;
+float PidOutRight;
+float LastPidOutLeft;
+float LastPidOutRight;
+/**********************************************************************************************************
+*	函 数 名：PID_Cal
+*	功能说明：位置式PID控制
+*   输    入：
+    NowValue:当前值
+    AimValue:目标值
+*   输    出：PID控制值，直接赋值给执行函数
+**********************************************************************************************************/ 
+float PID_Cal(PID *pid, int32_t NowValue, int32_t AimValue)
+{
+ 
+    float  iError,     //当前误差
+            Output;    //控制输出	
+ 
+    iError = AimValue - NowValue;                   //计算当前误差
+	
+#ifdef 	PID_INTEGRAL_ON	
+    pid->Integral += pid->I * iError;	            //位置式PID积分项累加
+    pid->Integral = pid->Integral > pid->IntegralMax?pid->IntegralMax:pid->Integral;  //积分项上限幅
+    pid->Integral = pid->Integral <-pid->IntegralMax?-pid->IntegralMax:pid->Integral; //积分项下限幅
+#endif		
+	
+    Output = pid->P * iError                        //比例P            
+           + pid->D * (iError - pid->Last_Error);   //微分D
+	
+#ifdef 	PID_INTEGRAL_ON		
+    Output += pid->Integral;                        //积分I
+#endif	
+ 
+    Output = Output > pid->OutputMax?pid->OutputMax:Output;  //控制输出上限幅
+    Output = Output <-pid->OutputMax?-pid->OutputMax:Output; //控制输出下限幅
+	
+	pid->Last_Error = iError;		  	                     //更新上次误差，用于下次计算 
+	return Output;	//返回控制输出值
+}
+
+
+
+void Pwm_Init(void)
+{
+		GPIO_setAsInputPin(GPIO_PORT_P7,GPIO_PIN6);
+    GPIO_setAsInputPin(GPIO_PORT_P7,GPIO_PIN7);
+    GPIO_setAsInputPin(GPIO_PORT_P10,GPIO_PIN0);
+    GPIO_setAsInputPin(GPIO_PORT_P10,GPIO_PIN1);
+    GPIO_setAsInputPin(GPIO_PORT_P10,GPIO_PIN2);
+    GPIO_setAsInputPin(GPIO_PORT_P10,GPIO_PIN3);
+    GPIO_setAsInputPin(GPIO_PORT_P10,GPIO_PIN4);
+    GPIO_setAsInputPin(GPIO_PORT_P10,GPIO_PIN5);
+		MAP_PCM_setPowerState(PCM_AM_LF_VCORE0);
+		MAP_GPIO_setAsPeripheralModuleFunctionOutputPin(GPIO_PORT_P2, GPIO_PIN4, GPIO_PRIMARY_MODULE_FUNCTION);
+    MAP_GPIO_setAsPeripheralModuleFunctionOutputPin(GPIO_PORT_P5, GPIO_PIN6, GPIO_PRIMARY_MODULE_FUNCTION);
+}
+int LeftRevTime=0;
+int RightRevTime=0;
+int RevJudgeTime=8;//转角延时
+bool LeftRevFlag=false;
+bool RightRevFlag=false;
+void Pwm_Out(void)
+{			
+			int LeftJudge=0;
+			int RightJudge=0;
+			uint8_t LeftLimit=GPIO_getInputPinValue(GPIO_PORT_P7,GPIO_PIN6);
+			uint8_t RightLimit=GPIO_getInputPinValue(GPIO_PORT_P10,GPIO_PIN5);
+			uint8_t H[8];
+			H[0]=GPIO_getInputPinValue(GPIO_PORT_P7,GPIO_PIN6);
+			H[1]=GPIO_getInputPinValue(GPIO_PORT_P7, GPIO_PIN7);
+			H[2]=GPIO_getInputPinValue(GPIO_PORT_P10, GPIO_PIN0);
+			H[3]=GPIO_getInputPinValue(GPIO_PORT_P10, GPIO_PIN1);
+			H[4]=GPIO_getInputPinValue(GPIO_PORT_P10, GPIO_PIN2);
+			H[5]=GPIO_getInputPinValue(GPIO_PORT_P10, GPIO_PIN3);
+			H[6]=GPIO_getInputPinValue(GPIO_PORT_P10, GPIO_PIN4);
+			H[7]=GPIO_getInputPinValue(GPIO_PORT_P10, GPIO_PIN5);
+			//判断左右巡线指数
+			for(int i=0;i<4;i++){
+				if(H[i]){
+					LeftJudge++;
+				}
+				if(H[i+4]){
+					RightJudge++;
+				}
+			}
+			int LeftErr=CalcuErrorLeft();
+			int RightErr=CalcuErrorRight();
+			int SumErr=LeftErr-RightErr;
+			int Dead=180; 
+			//大弯减速，Dead死区一般给180
+			if(LeftLimit || RightLimit){
+				Dead=80;
+			}else{
+				Dead=180 ;
+			}
+			//差速输出
+			PidOutLeft=Dead+PID_Cal(&a,SumErr,0);
+			PidOutRight=Dead-PID_Cal(&a,SumErr,0);			
+			if(LeftLimit || RightLimit){
+				OLED_ShowNum(40*1, 4,123, 4, 8);//用于验证是否接受到高电平 
+			}
+			//限幅
+				if(PidOutLeft>200){
+					PidOutLeft=200;
+				}
+				if(PidOutRight>200){
+					PidOutRight=200;
+				}
+				if(PidOutRight<0){
+					PidOutRight=0;
+				}
+				if(PidOutLeft<0){
+					PidOutLeft=0;
+				}
+			//特殊条件
+			if(LeftLimit){
+				LeftRevFlag=true;
+			}
+			if(RightLimit){
+				RightRevFlag=true;
+			}
+			if(LeftRevFlag){
+				LeftRevTime++;
+			}
+			if(RightRevFlag){
+				RightRevTime++;
+			}
+			//特殊弯道，给一定延迟，让其转完整个弯道
+			if(LeftRevTime>=RevJudgeTime || RightRevTime>=RevJudgeTime){
+				LeftRevTime=0;
+				RightRevTime=0;
+				LeftRevFlag=false;
+				RightRevFlag=false;
+			}
+			//走一定时间大弯，保证能转过去
+			if((LeftRevTime<RevJudgeTime && LeftRevFlag)){
+				pwmConfig10.dutyCycle=0;
+				pwmConfig11.dutyCycle=PidOutRight;
+			}
+			if((RightRevTime<RevJudgeTime && RightRevFlag)){
+				pwmConfig10.dutyCycle=PidOutLeft;
+				pwmConfig11.dutyCycle=0;
+			}
+			//下发空的PWM波，即保持上个状态
+			if((LeftErr==0 && RightErr==0) ||(H[7] && H[4]) || (H[0] && H[3])){
+				
+			}else{
+				pwmConfig10.dutyCycle=PidOutLeft;
+				pwmConfig11.dutyCycle=PidOutRight;
+			}
+				Timer_A_setCompareValue(TIMER_A0_BASE,TIMER_A_CAPTURECOMPARE_REGISTER_1,16);
+				MAP_Timer_A_generatePWM(TIMER_A0_BASE, &pwmConfig10);
+				Timer_A_setCompareValue(TIMER_A2_BASE,TIMER_A_CAPTURECOMPARE_REGISTER_1,16);
+				MAP_Timer_A_generatePWM(TIMER_A2_BASE, &pwmConfig11);
+			OLED_Clear();
+			OLED_ShowNum(12*1, 3,PidOutLeft, 4, 8); 
+			OLED_ShowNum(72*1, 3,PidOutRight, 4, 8); 
+			OLED_ShowNum(24*1, 7,LastPidOutLeft, 4, 8); 
+			OLED_ShowNum(56*1, 7,LastPidOutRight, 4, 8); 
+			OLED_ShowNum(24*1, 1,LeftRevTime, 4, 8); 
+			OLED_ShowNum(56*1, 1,RightRevTime, 4, 8); 
+			LastPidOutLeft=PidOutLeft;
+			LastPidOutRight=PidOutRight;
+}
+int CalcuErrorRight(void)
+{			
+			int ErrorLeft=0;
+			int EachErr[4];
+			uint8_t h[4];
+			for(int i=0;i<4;i++){
+				EachErr[i]=0;
+			}
+			h[0]=GPIO_getInputPinValue(GPIO_PORT_P10, GPIO_PIN2);
+			h[1]=GPIO_getInputPinValue(GPIO_PORT_P10, GPIO_PIN3);
+			h[2]=GPIO_getInputPinValue(GPIO_PORT_P10, GPIO_PIN4);
+			h[3]=GPIO_getInputPinValue(GPIO_PORT_P10, GPIO_PIN5);
+			if(h[0]){EachErr[0]=1;}
+			if(h[1]){EachErr[1]=3;}
+			if(h[2]){EachErr[2]=7;}
+			if(h[3]){EachErr[3]=20;}
+			for(int i=0;i<4;i++){
+				ErrorLeft=ErrorLeft+EachErr[i];
+			}
+			return ErrorLeft;
+}
+int CalcuErrorLeft(void)
+{			
+			int ErrorRight=0;
+			int EachErr[4];
+			uint8_t h[4];
+			for(int i=0;i<4;i++){
+				EachErr[i]=0;
+			}
+			h[0]=GPIO_getInputPinValue(GPIO_PORT_P7,GPIO_PIN6);
+			h[1]=GPIO_getInputPinValue(GPIO_PORT_P7, GPIO_PIN7);
+			h[2]=GPIO_getInputPinValue(GPIO_PORT_P10, GPIO_PIN0);
+			h[3]=GPIO_getInputPinValue(GPIO_PORT_P10, GPIO_PIN1);
+			if(h[0]){EachErr[0]=20;}
+			if(h[1]){EachErr[1]=7;}
+			if(h[2]){EachErr[2]=3;}
+			if(h[3]){EachErr[3]=1;}
+			for(int i=0;i<4;i++){
+				ErrorRight=ErrorRight+EachErr[i];
+			}
+			return ErrorRight;
+}
